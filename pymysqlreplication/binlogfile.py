@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 
+import os
 import pymysql
 import struct
-import os
+import time
 
 from pymysql.cursors import DictCursor
 from pymysql.util import int2byte
@@ -31,14 +32,27 @@ MYSQL_EXPECTED_ERROR_CODES = [2013, 2006]
 
 
 class ExtendedIO(object):
-    def __init__(self, target):
+    def __init__(self, target, blocking):
         self.target = target
+        self.blocking = blocking
 
     def __getattr__(self, name):
         return getattr(self.target, name)
 
+    def read(self, amount):
+        if not self.blocking:
+            return self.target.read(amount)
+
+        # There must be a better way to do a read that blocks on EOF
+        data = b''
+        while True:
+            data += self.target.read(amount - len(data))
+            if len(data) >= amount:
+                return data
+            time.sleep(2)
+
     def advance(self, amount):
-        self.target.read(amount)
+        self.read(amount)
         return
 
 class BinLogFileReader(object):
@@ -158,7 +172,7 @@ class BinLogFileReader(object):
     def __connect_to_file(self):
         self.__use_checksum = self.__checksum_enabled()
 
-        self._stream_connection = ExtendedIO(open(os.path.join(os.path.dirname(self.filename), self.log_file), 'rb'))
+        self._stream_connection = ExtendedIO(open(os.path.join(os.path.dirname(self.filename), self.log_file), 'rb'), self.__blocking)
         magic = self._stream_connection.read(4)
         if magic != self._expected_magic:
             messagefmt = 'Magic bytes {0!r} did not match expected {1!r}'
@@ -178,9 +192,19 @@ class BinLogFileReader(object):
 
             # Assemble MysqlPacket from binlog record
             header = self._stream_connection.read(19)
+
+            # Blocking is off and we've reached the end of the file
+            if len(header) < 19:
+                return None
             unpacked = struct.unpack('<IcIIIH', header) 
             event_size = unpacked[3]
-            pkt = MysqlPacket(b'\0' + header + self._stream_connection.read(event_size - 19), 'utf-8')
+
+            data = self._stream_connection.read(event_size - 19)
+            # Blocking is off and we've reached the end of the file
+            if len(data) < event_size - 19:
+                return None
+
+            pkt = MysqlPacket(b'\0' + header + data, 'utf-8')
 
             binlog_event = BinLogPacketWrapper(pkt, self.table_map,
                                                self._ctl_connection,
